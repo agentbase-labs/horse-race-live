@@ -20,11 +20,11 @@ const PORT = process.env.PORT || 3001;
 
 // ─── Horse definitions ────────────────────────────────────────────────────────
 const HORSES = [
-  { id: 1, name: 'Thunder', w: 35, color: '#e74c3c' },
-  { id: 2, name: 'Storm',   w: 25, color: '#3498db' },
-  { id: 3, name: 'Blaze',   w: 20, color: '#f39c12' },
-  { id: 4, name: 'Shadow',  w: 12, color: '#ffffff' },
-  { id: 5, name: 'Lucky',   w:  8, color: '#2c2c2c' },
+  { id: 1, name: 'Oded',  w: 35, color: '#e74c3c' },
+  { id: 2, name: 'Shon',  w: 25, color: '#3498db' },
+  { id: 3, name: 'Joy',   w: 20, color: '#f39c12' },
+  { id: 4, name: 'Naya',  w: 12, color: '#ffffff' },
+  { id: 5, name: 'Lai',   w:  8, color: '#2c2c2c' },
 ];
 const TOTAL_WEIGHT = HORSES.reduce((s, h) => s + h.w, 0); // 100
 
