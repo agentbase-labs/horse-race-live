@@ -18,13 +18,50 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3001;
 
+// ─── Rain Protocol SDK ─────────────────────────────────────────────────────────
+let rain = null;
+let rainEnabled = false;
+let resolverWallet = null;
+
+try {
+  const { Rain } = require('@buidlrrr/rain-sdk');
+  const { createWalletClient, http: viemHttp, createPublicClient } = require('viem');
+  const { privateKeyToAccount } = require('viem/accounts');
+  const { arbitrum } = require('viem/chains');
+
+  if (process.env.RESOLVER_PRIVATE_KEY) {
+    resolverWallet = privateKeyToAccount(process.env.RESOLVER_PRIVATE_KEY);
+    rain = new Rain({ environment: 'production' });
+
+    const walletClient = createWalletClient({
+      account: resolverWallet,
+      chain: arbitrum,
+      transport: viemHttp(process.env.ARBITRUM_RPC_URL || 'https://arb1.arbitrum.io/rpc'),
+    });
+
+    rain._walletClient = walletClient;
+    rain._publicClient = createPublicClient({
+      chain: arbitrum,
+      transport: viemHttp(process.env.ARBITRUM_RPC_URL || 'https://arb1.arbitrum.io/rpc'),
+    });
+
+    rainEnabled = true;
+    console.log('🌧️  Rain Protocol SDK initialized, resolver:', resolverWallet.address);
+  } else {
+    console.log('⚠️  RESOLVER_PRIVATE_KEY not set — Rain SDK disabled, running in demo mode');
+  }
+} catch (e) {
+  console.log('⚠️  Rain SDK not available, running in demo mode:', e.message);
+}
+
 // ─── Horse definitions ────────────────────────────────────────────────────────
 const HORSES = [
-  { id: 1, name: 'Oded',  w: 35, color: '#e74c3c' },
-  { id: 2, name: 'Shon',  w: 25, color: '#3498db' },
-  { id: 3, name: 'Joy',   w: 20, color: '#f39c12' },
+  { id: 1, name: 'Oded',  w: 30, color: '#e74c3c' },
+  { id: 2, name: 'Shon',  w: 22, color: '#3498db' },
+  { id: 3, name: 'Joy',   w: 18, color: '#f39c12' },
   { id: 4, name: 'Naya',  w: 12, color: '#ffffff' },
   { id: 5, name: 'Lai',   w:  8, color: '#2c2c2c' },
+  { id: 6, name: 'Hadar', w: 10, color: '#9b59b6' },
 ];
 const TOTAL_WEIGHT = HORSES.reduce((s, h) => s + h.w, 0); // 100
 
@@ -62,6 +99,155 @@ function generateProvablyFairSeed() {
   return { seed, hash };
 }
 
+// ─── Rain Market State ────────────────────────────────────────────────────────
+let currentRaceNumber = 0;
+let currentMarket = null; // { marketId, contractAddress, options, txHash }
+let marketCreationPending = false;
+
+async function createRainMarket(raceNumber) {
+  if (!rainEnabled || !rain || !resolverWallet) {
+    console.log(`[rain] Demo mode — skipping market creation for race #${raceNumber}`);
+    // Return a mock market for demo mode
+    return {
+      marketId: `demo-${raceNumber}`,
+      contractAddress: '0x0000000000000000000000000000000000000000',
+      options: HORSES.map((h, i) => ({
+        id: i + 1,
+        name: h.name,
+        odds: calcOdds(h),
+      })),
+      isDemoMarket: true,
+    };
+  }
+
+  try {
+    console.log(`[rain] Creating market for race #${raceNumber}...`);
+
+    const now = Math.floor(Date.now() / 1000);
+    const txList = await rain.buildCreateMarketTx({
+      marketQuestion: `Race #${raceNumber}: Who will win?`,
+      marketOptions: HORSES.map(h => h.name),
+      marketTags: ['racing', 'horse-race'],
+      isPublic: true,
+      isPublicPoolResolverAi: false,
+      creator: resolverWallet.address,
+      startTime: BigInt(now + 60),
+      endTime: BigInt(now + 300),
+      no_of_options: 5n,
+      inputAmountWei: 10_000_000n, // 10 USDT initial liquidity
+      barValues: [35, 25, 20, 12, 8], // initial odds matching horse weights
+      baseToken: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9',
+      tokenDecimals: 6,
+    });
+
+    // Execute transactions
+    let lastTxHash = null;
+    let marketId = null;
+    let contractAddress = null;
+
+    for (const tx of txList) {
+      const hash = await rain._walletClient.sendTransaction({
+        to: tx.to,
+        data: tx.data,
+        value: tx.value || 0n,
+      });
+      lastTxHash = hash;
+      console.log(`[rain] Tx sent: ${hash}`);
+
+      // Wait for receipt
+      const receipt = await rain._publicClient.waitForTransactionReceipt({ hash });
+      console.log(`[rain] Tx confirmed in block ${receipt.blockNumber}`);
+
+      // Extract market info from logs if available
+      if (receipt.logs && receipt.logs.length > 0) {
+        // The last log from contract creation should have market address
+        const lastLog = receipt.logs[receipt.logs.length - 1];
+        if (lastLog.address && !contractAddress) {
+          contractAddress = lastLog.address;
+        }
+        // Try to extract marketId from logs
+        for (const log of receipt.logs) {
+          if (log.topics && log.topics[1]) {
+            // marketId is often in the second topic
+            try {
+              marketId = BigInt(log.topics[1]).toString();
+            } catch (e) {}
+          }
+        }
+      }
+    }
+
+    // Use tx hash as fallback marketId if not found from logs
+    if (!marketId) marketId = lastTxHash;
+    if (!contractAddress) contractAddress = '0x' + lastTxHash.substring(2, 42);
+
+    const market = {
+      marketId,
+      contractAddress,
+      txHash: lastTxHash,
+      options: HORSES.map((h, i) => ({
+        id: i + 1,
+        name: h.name,
+        odds: calcOdds(h),
+      })),
+      isDemoMarket: false,
+    };
+
+    console.log(`[rain] Market created: ${marketId} at ${contractAddress}`);
+    return market;
+  } catch (e) {
+    console.error('[rain] Failed to create market:', e.message);
+    // Fallback to demo market on error
+    return {
+      marketId: `fallback-${raceNumber}`,
+      contractAddress: '0x0000000000000000000000000000000000000000',
+      options: HORSES.map((h, i) => ({
+        id: i + 1,
+        name: h.name,
+        odds: calcOdds(h),
+      })),
+      isDemoMarket: true,
+      error: e.message,
+    };
+  }
+}
+
+async function resolveRainMarket(marketId, winnerIndex) {
+  if (!rainEnabled || !rain || !resolverWallet) {
+    console.log(`[rain] Demo mode — skipping market resolve for ${marketId}`);
+    return;
+  }
+  if (!marketId || marketId.startsWith('demo-') || marketId.startsWith('fallback-')) {
+    console.log(`[rain] Skipping resolve for demo/fallback market: ${marketId}`);
+    return;
+  }
+
+  try {
+    console.log(`[rain] Resolving market ${marketId} with winner option ${winnerIndex + 1}...`);
+
+    const txList = await rain.buildResolveMarketTx({
+      marketId,
+      winningOption: winnerIndex + 1, // 1-indexed!
+    });
+
+    for (const tx of txList) {
+      const hash = await rain._walletClient.sendTransaction({
+        to: tx.to,
+        data: tx.data,
+        value: tx.value || 0n,
+      });
+      console.log(`[rain] Resolve tx sent: ${hash}`);
+
+      const receipt = await rain._publicClient.waitForTransactionReceipt({ hash });
+      console.log(`[rain] Resolve tx confirmed in block ${receipt.blockNumber}`);
+    }
+
+    console.log(`[rain] Market ${marketId} resolved. Winner: option ${winnerIndex + 1} (${HORSES[winnerIndex].name})`);
+  } catch (e) {
+    console.error('[rain] Failed to resolve market:', e.message);
+  }
+}
+
 // ─── In-memory state ──────────────────────────────────────────────────────────
 /** @type {Map<string, {balance: number, bet: {horseId: number, amount: number} | null}>} */
 const users = new Map();
@@ -70,6 +256,9 @@ const raceHistory = []; // last 10 winners
 
 // ─── Bet stats for popularity bars ───────────────────────────────────────────
 const betStats = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }; // total bet amounts per horse
+
+// Track on-chain bets: socketId -> { horseId, txHash, walletAddress }
+const onChainBets = new Map();
 
 function getBetStats() {
   const total = Object.values(betStats).reduce((a, b) => a + b, 0);
@@ -101,6 +290,7 @@ let gameState = {
   serverTime: Date.now(),
   raceStartTime: null,
   currentHash: null,
+  currentMarketId: null,
 };
 
 let gameInterval = null;
@@ -126,6 +316,9 @@ function broadcastGameState() {
     raceStartTime: gameState.raceStartTime,
     currentHash:   gameState.currentHash,
     betStats:      getBetStats(),
+    // Rain market info
+    currentMarketId:      gameState.currentMarketId,
+    rainEnabled,
   };
   io.emit('game_state', payload);
 }
@@ -170,6 +363,25 @@ function settleRace(winner) {
 function startGameLoop() {
   if (gameInterval) clearInterval(gameInterval);
 
+  // Create initial market for first betting phase
+  currentRaceNumber++;
+  (async () => {
+    marketCreationPending = true;
+    currentMarket = await createRainMarket(currentRaceNumber);
+    gameState.currentMarketId = currentMarket.marketId;
+    marketCreationPending = false;
+    // Notify clients of market creation
+    io.emit('race_market_created', {
+      marketId: currentMarket.marketId,
+      contractAddress: currentMarket.contractAddress,
+      options: currentMarket.options,
+      isDemoMarket: currentMarket.isDemoMarket,
+      raceNumber: currentRaceNumber,
+    });
+    broadcastGameState();
+    console.log(`[market] Race #${currentRaceNumber} market ready: ${currentMarket.marketId}`);
+  })();
+
   gameInterval = setInterval(() => {
     gameState.timeLeft--;
     gameState.serverTime = Date.now();
@@ -205,8 +417,22 @@ function startGameLoop() {
         // Add to history (keep last 10)
         raceHistory.unshift(gameState.currentWinner);
         if (raceHistory.length > 10) raceHistory.pop();
-        // Settle bets
+        // Settle bets (internal balance)
         settleRace(gameState.currentWinner);
+        // Resolve Rain market (async, non-blocking)
+        if (currentMarket && gameState.currentWinner) {
+          const winnerHorseIndex = HORSES.findIndex(h => h.id === gameState.currentWinner.id);
+          const marketIdToResolve = currentMarket.marketId;
+          resolveRainMarket(marketIdToResolve, winnerHorseIndex)
+            .then(() => {
+              io.emit('market_resolved', {
+                marketId: marketIdToResolve,
+                winnerId: gameState.currentWinner.id,
+                winnerName: gameState.currentWinner.name,
+              });
+            })
+            .catch(e => console.error('[rain] Resolve error:', e.message));
+        }
       }
 
     } else if (gameState.state === STATES.RESULTS.name) {
@@ -218,9 +444,29 @@ function startGameLoop() {
         io.emit('race_hash', { hash: currentHash });
         // Reset bet stats for next round
         resetBetStats();
+        onChainBets.clear();
         // Reset for next round
         gameState.currentWinner = null;
         transitionTo(STATES.BETTING.name);
+
+        // Create new Rain market for next round
+        currentRaceNumber++;
+        const nextRaceNumber = currentRaceNumber;
+        (async () => {
+          marketCreationPending = true;
+          currentMarket = await createRainMarket(nextRaceNumber);
+          gameState.currentMarketId = currentMarket.marketId;
+          marketCreationPending = false;
+          io.emit('race_market_created', {
+            marketId: currentMarket.marketId,
+            contractAddress: currentMarket.contractAddress,
+            options: currentMarket.options,
+            isDemoMarket: currentMarket.isDemoMarket,
+            raceNumber: nextRaceNumber,
+          });
+          broadcastGameState();
+          console.log(`[market] Race #${nextRaceNumber} market ready: ${currentMarket.marketId}`);
+        })();
       }
     }
 
@@ -248,8 +494,21 @@ io.on('connection', (socket) => {
       raceStartTime: gameState.raceStartTime,
       currentHash:   gameState.currentHash,
       betStats:      getBetStats(),
+      currentMarketId: gameState.currentMarketId,
+      rainEnabled,
     });
     socket.emit('balance_update', { balance: user.balance });
+
+    // Send current market info
+    if (currentMarket) {
+      socket.emit('race_market_created', {
+        marketId: currentMarket.marketId,
+        contractAddress: currentMarket.contractAddress,
+        options: currentMarket.options,
+        isDemoMarket: currentMarket.isDemoMarket,
+        raceNumber: currentRaceNumber,
+      });
+    }
 
     // If race is ongoing, also send race_start so client can animate correctly
     if (gameState.state === 'race' && gameState.currentWinner) {
@@ -269,7 +528,7 @@ io.on('connection', (socket) => {
     console.log(`[join] ${socket.id} — balance: ${user.balance}`);
   });
 
-  // Handle place_bet
+  // Handle place_bet (legacy / internal balance mode)
   socket.on('place_bet', ({ horseId, amount }) => {
     const user = users.get(socket.id);
     if (!user) return;
@@ -311,8 +570,58 @@ io.on('connection', (socket) => {
     console.log(`[bet] ${socket.id} bet ${betAmount} on horse ${horseId}`);
   });
 
+  // Handle on-chain bet confirmation (Rain Protocol)
+  socket.on('confirm_onchain_bet', ({ horseId, txHash, walletAddress, amount }) => {
+    const user = users.get(socket.id);
+    if (!user) return;
+
+    if (gameState.state !== 'betting' || gameState.timeLeft <= 0) {
+      socket.emit('bet_error', { message: 'Betting is closed.' });
+      return;
+    }
+
+    const horse = HORSES.find(h => h.id === horseId);
+    if (!horse) {
+      socket.emit('bet_error', { message: 'Invalid horse.' });
+      return;
+    }
+
+    if (!txHash || !txHash.startsWith('0x')) {
+      socket.emit('bet_error', { message: 'Invalid transaction hash.' });
+      return;
+    }
+
+    // Record on-chain bet
+    onChainBets.set(socket.id, {
+      horseId,
+      txHash,
+      walletAddress,
+      amount: amount || 0,
+      confirmedAt: Date.now(),
+    });
+
+    // Also register as internal bet for race result tracking
+    user.bet = { horseId, amount: amount || 0, onChain: true, txHash };
+
+    // Update bet stats
+    betStats[horseId] = (betStats[horseId] || 0) + (amount || 10);
+
+    socket.emit('bet_confirmed', {
+      horseId,
+      amount: amount || 0,
+      txHash,
+      onChain: true,
+    });
+
+    // Broadcast updated bet stats to all
+    io.emit('bet_stats_update', { betStats: getBetStats() });
+
+    console.log(`[onchain-bet] ${socket.id} bet ${amount} USDT on horse ${horseId}, tx: ${txHash}`);
+  });
+
   socket.on('disconnect', () => {
     users.delete(socket.id);
+    onChainBets.delete(socket.id);
     console.log(`[disconnect] ${socket.id}`);
   });
 });
@@ -324,11 +633,21 @@ app.get('/api/status', (req, res) => {
     game: gameState.state,
     timeLeft: gameState.timeLeft,
     connectedUsers: users.size,
+    rainEnabled,
+    currentMarketId: gameState.currentMarketId,
   });
 });
 
 app.get('/history', (req, res) => {
   res.json({ raceHistory });
+});
+
+app.get('/api/market', (req, res) => {
+  res.json({
+    currentMarket,
+    raceNumber: currentRaceNumber,
+    rainEnabled,
+  });
 });
 
 // ─── Serve static frontend ────────────────────────────────────────────────────
@@ -344,12 +663,13 @@ if (require('fs').existsSync(publicDir)) {
       game: gameState.state,
       timeLeft: gameState.timeLeft,
       connectedUsers: users.size,
+      rainEnabled,
     });
   });
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`🏇 Horse Race server running on http://localhost:${PORT}`);
+  console.log(`🏇 Horse Race (Rain Integration) server running on http://localhost:${PORT}`);
   startGameLoop();
 });
