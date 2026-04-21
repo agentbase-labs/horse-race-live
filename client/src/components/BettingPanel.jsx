@@ -36,6 +36,8 @@ export default function BettingPanel({
   betStats,
   rainEnabled,
   currentMarket,
+  activeTrack,
+  setActiveTrack,
 }) {
   const isBetting = gameState === 'betting';
   const disabled  = !bettingOpen || !!activeBet;
@@ -46,7 +48,6 @@ export default function BettingPanel({
   const [useOnChain, setUseOnChain] = useState(false);
   const [usdtAmount, setUsdtAmount] = useState(5);
   const [carouselIndex, setCarouselIndex] = useState(0);
-  const [activeTrack, setActiveTrack] = useState('dirt');
   const touchStartX = useRef(null);
 
   const totalHorses = horses.length || 5;
